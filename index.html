@@ -123,6 +123,54 @@ html, body {
 
 		<script src="index.js"></script>
 		<script>
+// iOS Safari rejects an AudioContext whose sampleRate is not the hardware
+// rate, and it stays suspended until a user gesture. Wrap the constructor
+// before Godot starts so the context uses the device rate, then resume it
+// and play a one-sample buffer on the first tap.
+(function () {
+	var Native = window.AudioContext || window.webkitAudioContext;
+	if (!Native || Native.__blackline) {
+		return;
+	}
+	var contexts = [];
+	function Patched(opts) {
+		var ctx;
+		try {
+			ctx = new Native();
+		} catch (err) {
+			ctx = opts ? new Native(opts) : new Native();
+		}
+		contexts.push(ctx);
+		window.__blAudioContexts = contexts;
+		return ctx;
+	}
+	Patched.prototype = Native.prototype;
+	Patched.__blackline = true;
+	window.AudioContext = Patched;
+	if (window.webkitAudioContext) {
+		window.webkitAudioContext = Patched;
+	}
+	function unlock() {
+		contexts.forEach(function (ctx) {
+			if (!ctx) {
+				return;
+			}
+			if (ctx.state !== "running") {
+				ctx.resume();
+			}
+			try {
+				var buf = ctx.createBuffer(1, 1, ctx.sampleRate || 48000);
+				var src = ctx.createBufferSource();
+				src.buffer = buf;
+				src.connect(ctx.destination);
+				src.start(0);
+			} catch (err) {}
+		});
+	}
+	window.addEventListener("touchstart", unlock, { passive: true });
+	window.addEventListener("pointerdown", unlock, { passive: true });
+	window.addEventListener("mousedown", unlock, true);
+})();
 // iOS Safari will pan, double-tap zoom, and pinch the page unless the canvas
 // itself refuses the gesture. Godot's own listener is not always registered
 // with passive:false for the gesture events, which only exist on WebKit.
@@ -148,7 +196,7 @@ html, body {
 }());
 		</script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":10893220,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4,"serviceWorker":"index.service.worker.js"};
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":10897712,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4,"serviceWorker":"index.service.worker.js"};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
