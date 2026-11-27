@@ -4,7 +4,7 @@
 // Incrementing CACHE_VERSION will kick off the install event and force
 // previously cached resources to be updated from the network.
 /** @type {string} */
-const CACHE_VERSION = '1795760398|2238748';
+const CACHE_VERSION = '1795761531|2127756';
 /** @type {string} */
 const CACHE_PREFIX = 'Blackline Paintb-sw-cache-';
 const CACHE_NAME = CACHE_PREFIX + CACHE_VERSION;
