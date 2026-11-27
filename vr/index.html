@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+		<title>Blackline Paintball VR</title>
+		<style>
+html, body, #canvas {
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+html, body {
+	color: white;
+	background-color: black;
+	overflow: hidden;
+	touch-action: none;
+	-webkit-user-select: none;
+	user-select: none;
+	-webkit-touch-callout: none;
+	-webkit-tap-highlight-color: transparent;
+}
+
+#canvas {
+	display: block;
+	touch-action: none;
+	-webkit-user-select: none;
+	user-select: none;
+	-webkit-touch-callout: none;
+}
+
+#canvas:focus {
+	outline: none;
+}
+
+#status, #status-splash, #status-progress {
+	position: absolute;
+	left: 0;
+	right: 0;
+}
+
+#status, #status-splash {
+	top: 0;
+	bottom: 0;
+}
+
+#status {
+	background-color: #0d1217;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	align-items: center;
+	visibility: hidden;
+}
+
+#status-splash {
+	max-height: 100%;
+	max-width: 100%;
+	margin: auto;
+}
+
+#status-splash.show-image--false {
+	display: none;
+}
+
+#status-splash.fullsize--true {
+	height: 100%;
+	width: 100%;
+	object-fit: contain;
+}
+
+#status-splash.use-filter--false {
+	image-rendering: pixelated;
+}
+
+#status-progress, #status-notice {
+	display: none;
+}
+
+#status-progress {
+	bottom: 10%;
+	width: 50%;
+	margin: 0 auto;
+}
+
+#status-notice {
+	background-color: #5b3943;
+	border-radius: 0.5rem;
+	border: 1px solid #9b3943;
+	color: #e0e0e0;
+	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
+	line-height: 1.3;
+	margin: 0 2rem;
+	overflow: hidden;
+	padding: 1rem;
+	text-align: center;
+	z-index: 1;
+}
+		</style>
+		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
+<link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
+<link rel="manifest" href="index.manifest.json">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#0c1016">
+	</head>
+	<body>
+		<canvas id="canvas">
+			Your browser does not support the canvas tag.
+		</canvas>
+
+		<noscript>
+			Your browser does not support JavaScript.
+		</noscript>
+
+		<div id="status">
+			<img id="status-splash" class="show-image--false fullsize--true use-filter--true" src="index.png" alt="">
+			<progress id="status-progress"></progress>
+			<div id="status-notice"></div>
+		</div>
+		<audio id="bl-silent" loop playsinline preload="auto" style="position:absolute;width:0;height:0;opacity:0;pointer-events:none" src="data:audio/wav;base64,UklGRmQBAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="></audio>
+
+		<script>
+// Record every AudioContext Godot constructs. This has to run before index.js
+// so the engine's own constructor call is the one we resume on the first tap.
+(function () {
+	var Native = window.AudioContext || window.webkitAudioContext;
+	if (!Native || Native.__blackline) {
+		return;
+	}
+	var contexts = [];
+	var retries = [];
+	window.__blWorkletStatus = 'none';
+	function remember(ctx) {
+		if (contexts.indexOf(ctx) < 0) {
+			contexts.push(ctx);
+		}
+		window.__blAudioContexts = contexts;
+		return ctx;
+	}
+	function hookWorklet(ctx) {
+		var aw = ctx.audioWorklet;
+		if (!aw || aw.__blHooked || typeof aw.addModule !== 'function') {
+			console.log('worklet status', window.__blWorkletStatus, 'no addModule', ctx.state);
+			return;
+		}
+		aw.__blHooked = true;
+		var orig = aw.addModule.bind(aw);
+		aw.addModule = function (moduleUrl, options) {
+			console.log('worklet addModule', moduleUrl, 'state', ctx.state);
+			function attempt() {
+				return orig(moduleUrl, options).then(function (result) {
+					window.__blWorkletStatus = 'loaded';
+					console.log('worklet loaded', moduleUrl, 'state', ctx.state);
+					return result;
+				});
+			}
+			return attempt().catch(function (err) {
+				window.__blWorkletStatus = 'rejected';
+				console.error('worklet addModule rejected', moduleUrl, 'state', ctx.state, err);
+				return new Promise(function (resolve, reject) {
+					var ran = false;
+					function retry() {
+						if (ran) {
+							return;
+						}
+						ran = true;
+						console.log('worklet retry', moduleUrl, 'state', ctx.state);
+						attempt().then(function (result) {
+							window.__blWorkletStatus = 'loaded-retry';
+							console.log('worklet retry ok', ctx.state);
+							resolve(result);
+						}, function (err2) {
+							window.__blWorkletStatus = 'rejected-retry';
+							console.error('worklet retry failed', err2);
+							reject(err2);
+						});
+					}
+					if (ctx.state === 'running') {
+						retry();
+						return;
+					}
+					retries.push(retry);
+					ctx.addEventListener('statechange', function onState() {
+						if (ctx.state === 'running') {
+							ctx.removeEventListener('statechange', onState);
+							retry();
+						}
+					});
+				});
+			});
+		};
+	}
+	function Patched(opts) {
+		var ctx;
+		try {
+			ctx = opts ? new Native(opts) : new Native();
+		} catch (err) {
+			console.error('AudioContext constructor failed, retrying without options', err);
+			ctx = new Native();
+		}
+		remember(ctx);
+		hookWorklet(ctx);
+		console.log('AudioContext created', ctx.state, 'sampleRate', ctx.sampleRate, 'worklet', window.__blWorkletStatus);
+		if (window.__blAudioUnlocked && ctx.state !== 'running') {
+			ctx.resume();
+		}
+		return ctx;
+	}
+	Patched.prototype = Native.prototype;
+	Patched.__blackline = true;
+	window.AudioContext = Patched;
+	if (window.webkitAudioContext) {
+		window.webkitAudioContext = Patched;
+	}
+	function logContexts(label) {
+		if (!contexts.length) {
+			console.log(label, 'missing', 'worklet', window.__blWorkletStatus);
+			return;
+		}
+		contexts.forEach(function (ctx) {
+			console.log(label, ctx.state, 'worklet', window.__blWorkletStatus);
+		});
+	}
+	function flushRetries() {
+		var pending = retries.splice(0, retries.length);
+		pending.forEach(function (retry) {
+			retry();
+		});
+	}
+	window.__blResumeAudio = function () {
+		logContexts('AudioContext state');
+		contexts.forEach(function (ctx) {
+			if (!ctx || ctx.state === 'closed' || ctx.state === 'running') {
+				return;
+			}
+			ctx.resume().then(function () {
+				console.log('AudioContext state', ctx.state, 'worklet', window.__blWorkletStatus);
+				flushRetries();
+			}, function (err) {
+				console.error('AudioContext resume failed', err);
+			});
+		});
+	};
+	var unlocked = false;
+	function unlock() {
+		if (unlocked) {
+			return;
+		}
+		unlocked = true;
+		window.__blAudioUnlocked = true;
+		try {
+			if (navigator.audioSession) {
+				navigator.audioSession.type = 'playback';
+				console.log('audioSession', navigator.audioSession.type);
+			}
+		} catch (err) {
+			console.error('audioSession', err);
+		}
+		var el = document.getElementById('bl-silent');
+		if (el) {
+			var played = el.play();
+			if (played && played.catch) {
+				played.catch(function (err) {
+					console.error('silent audio', err);
+				});
+			}
+		}
+		logContexts('AudioContext state before resume');
+		window.__blResumeAudio();
+		flushRetries();
+	}
+	var listen = { capture: true, passive: true, once: true };
+	['touchstart', 'touchend', 'pointerdown', 'click'].forEach(function (type) {
+		window.addEventListener(type, unlock, listen);
+	});
+	function pickRate(rates, prefer) {
+		var list = [];
+		if (rates && rates.length) {
+			list = Array.prototype.slice.call(rates);
+		}
+		list.sort(function (a, b) { return a - b; });
+		if (!list.length) {
+			return prefer;
+		}
+		if (list.indexOf(prefer) >= 0) {
+			return prefer;
+		}
+		var under = list.filter(function (n) { return n <= prefer; });
+		return under.length ? under[under.length - 1] : list[0];
+	}
+	window.__blLockFrameRate = function () {
+		var session = window.__blXRSession;
+		if (!session || !session.updateTargetFrameRate) {
+			console.log('updateTargetFrameRate unavailable');
+			return;
+		}
+		var rates = session.supportedFrameRates || [];
+		console.log('supportedFrameRates', Array.prototype.join.call(rates, ','));
+		var target = pickRate(rates, 72);
+		session.updateTargetFrameRate(target).then(function () {
+			window.__blFrameRate = target;
+			console.log('updateTargetFrameRate', target);
+		}, function (err) {
+			console.error('updateTargetFrameRate failed', err);
+		});
+	};
+	window.__blDropFrameRate = function () {
+		var session = window.__blXRSession;
+		if (!session || !session.updateTargetFrameRate) {
+			return;
+		}
+		var rates = session.supportedFrameRates || [];
+		var current = window.__blFrameRate || 72;
+		var list = Array.prototype.slice.call(rates).sort(function (a, b) { return a - b; });
+		var lower = list.filter(function (n) { return n < current - 0.5; });
+		if (!lower.length) {
+			console.log('updateTargetFrameRate already lowest', current);
+			return;
+		}
+		var target = lower[lower.length - 1];
+		session.updateTargetFrameRate(target).then(function () {
+			window.__blFrameRate = target;
+			console.log('updateTargetFrameRate dropped', target);
+		}, function (err) {
+			console.error('updateTargetFrameRate drop failed', err);
+		});
+	};
+	if (navigator.xr && navigator.xr.requestSession) {
+		var origRequest = navigator.xr.requestSession.bind(navigator.xr);
+		navigator.xr.requestSession = function (mode, opts) {
+			return origRequest(mode, opts).then(function (session) {
+				window.__blXRSession = session;
+				console.log('XR session', mode);
+				window.__blLockFrameRate();
+				return session;
+			});
+		};
+	}
+})();
+		</script>
+		<script src="index.js"></script>
+		<script>
+// iOS Safari will pan, double-tap zoom, and pinch the page unless the canvas
+// itself refuses the gesture. Godot's own listener is not always registered
+// with passive:false for the gesture events, which only exist on WebKit.
+(function () {
+	var stop = function (ev) { ev.preventDefault(); };
+	["gesturestart", "gesturechange", "gestureend"].forEach(function (name) {
+		document.addEventListener(name, stop, { passive: false });
+	});
+	document.addEventListener("touchmove", stop, { passive: false });
+	var drop = function () {
+		var fn = window.blacklineDropFingers;
+		if (typeof fn === "function") {
+			fn();
+		}
+	};
+	document.addEventListener("visibilitychange", function () {
+		if (document.hidden) {
+			drop();
+		} else if (window.__blResumeAudio) {
+			window.__blResumeAudio();
+		}
+	});
+	window.addEventListener("focus", function () {
+		if (window.__blResumeAudio) {
+			window.__blResumeAudio();
+		}
+	});
+	window.addEventListener("pagehide", drop);
+	window.addEventListener("blur", drop);
+}());
+		</script>
+		<script>
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":9583748,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4,"serviceWorker":"index.service.worker.js"};
+const GODOT_THREADS_ENABLED = false;
+const engine = new Engine(GODOT_CONFIG);
+
+(function () {
+	const statusOverlay = document.getElementById('status');
+	const statusProgress = document.getElementById('status-progress');
+	const statusNotice = document.getElementById('status-notice');
+
+	let initializing = true;
+	let statusMode = '';
+
+	function setStatusMode(mode) {
+		if (statusMode === mode || !initializing) {
+			return;
+		}
+		if (mode === 'hidden') {
+			statusOverlay.remove();
+			initializing = false;
+			return;
+		}
+		statusOverlay.style.visibility = 'visible';
+		statusProgress.style.display = mode === 'progress' ? 'block' : 'none';
+		statusNotice.style.display = mode === 'notice' ? 'block' : 'none';
+		statusMode = mode;
+	}
+
+	function setStatusNotice(text) {
+		while (statusNotice.lastChild) {
+			statusNotice.removeChild(statusNotice.lastChild);
+		}
+		const lines = text.split('\n');
+		lines.forEach((line) => {
+			statusNotice.appendChild(document.createTextNode(line));
+			statusNotice.appendChild(document.createElement('br'));
+		});
+	}
+
+	function displayFailureNotice(err) {
+		console.error(err);
+		if (err instanceof Error) {
+			setStatusNotice(err.message);
+		} else if (typeof err === 'string') {
+			setStatusNotice(err);
+		} else {
+			setStatusNotice('An unknown error occurred.');
+		}
+		setStatusMode('notice');
+		initializing = false;
+	}
+
+	if ('serviceWorker' in navigator) {
+		let refreshing = false;
+		navigator.serviceWorker.addEventListener('controllerchange', function () {
+			if (refreshing) {
+				return;
+			}
+			refreshing = true;
+			window.location.reload();
+		});
+	}
+
+	const missing = Engine.getMissingFeatures({
+		threads: GODOT_THREADS_ENABLED,
+	});
+
+	if (missing.length !== 0) {
+		if (GODOT_CONFIG['serviceWorker'] && GODOT_CONFIG['ensureCrossOriginIsolationHeaders'] && 'serviceWorker' in navigator) {
+			let serviceWorkerRegistrationPromise;
+			try {
+				serviceWorkerRegistrationPromise = navigator.serviceWorker.getRegistration();
+			} catch (err) {
+				serviceWorkerRegistrationPromise = Promise.reject(new Error('Service worker registration failed.'));
+			}
+			// There's a chance that installing the service worker would fix the issue
+			Promise.race([
+				serviceWorkerRegistrationPromise.then((registration) => {
+					if (registration != null) {
+						return Promise.reject(new Error('Service worker already exists.'));
+					}
+					return registration;
+				}).then(() => engine.installServiceWorker()),
+				// For some reason, `getRegistration()` can stall
+				new Promise((resolve) => {
+					setTimeout(() => resolve(), 2000);
+				}),
+			]).then(() => {
+				// Reload if there was no error.
+				window.location.reload();
+			}).catch((err) => {
+				console.error('Error while registering service worker:', err);
+			});
+		} else {
+			// Display the message as usual
+			const missingMsg = 'Error\nThe following features required to run Godot projects on the Web are missing:\n';
+			displayFailureNotice(missingMsg + missing.join('\n'));
+		}
+	} else {
+		setStatusMode('progress');
+		engine.startGame({
+			'onProgress': function (current, total) {
+				if (current > 0 && total > 0) {
+					statusProgress.value = current;
+					statusProgress.max = total;
+				} else {
+					statusProgress.removeAttribute('value');
+					statusProgress.removeAttribute('max');
+				}
+			},
+		}).then(() => {
+			setStatusMode('hidden');
+		}, displayFailureNotice);
+	}
+}());
+		</script>
+	</body>
+</html>
+
