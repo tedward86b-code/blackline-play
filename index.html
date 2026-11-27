@@ -97,24 +97,6 @@ html, body {
 	text-align: center;
 	z-index: 1;
 }
-
-#tap-to-start {
-	position: absolute;
-	left: 50%;
-	bottom: 16%;
-	transform: translateX(-50%);
-	z-index: 3;
-	display: none;
-	border: 0;
-	border-radius: 8px;
-	background: #38c6e6;
-	color: #071016;
-	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
-	font-size: 28px;
-	font-weight: 700;
-	padding: 16px 40px;
-	touch-action: manipulation;
-}
 		</style>
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
 <link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
@@ -136,48 +118,96 @@ html, body {
 		<div id="status">
 			<img id="status-splash" class="show-image--false fullsize--true use-filter--true" src="index.png" alt="">
 			<progress id="status-progress"></progress>
-			<button id="tap-to-start" type="button">Tap to start</button>
 			<div id="status-notice"></div>
 		</div>
+		<audio id="bl-silent" loop playsinline preload="auto" style="position:absolute;width:0;height:0;opacity:0;pointer-events:none" src="data:audio/wav;base64,UklGRmQBAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="></audio>
 
-		<script src="index.js"></script>
 		<script>
-// iOS Safari rejects an AudioContext whose sampleRate is not the hardware
-// rate, and it stays suspended until a user gesture. Wrap the constructor
-// before Godot starts so the context uses the device rate, then resume it
-// and play a one-sample buffer on the first tap.
+// Record every AudioContext Godot constructs. This has to run before index.js
+// so the engine's own constructor call is the one we resume on the first tap.
 (function () {
 	var Native = window.AudioContext || window.webkitAudioContext;
 	if (!Native || Native.__blackline) {
 		return;
 	}
 	var contexts = [];
-	var shared = null;
+	var retries = [];
+	window.__blWorkletStatus = 'none';
 	function remember(ctx) {
-		if (!ctx) {
-			return ctx;
-		}
 		if (contexts.indexOf(ctx) < 0) {
 			contexts.push(ctx);
 		}
 		window.__blAudioContexts = contexts;
 		return ctx;
 	}
-	function Patched(opts) {
-		// Godot constructs its context when the engine starts. Hand it the
-		// context this page already resumed inside the tap, so addModule
-		// runs on a running context instead of a suspended one.
-		if (shared && shared.state !== "closed") {
-			return remember(shared);
+	function hookWorklet(ctx) {
+		var aw = ctx.audioWorklet;
+		if (!aw || aw.__blHooked || typeof aw.addModule !== 'function') {
+			console.log('worklet status', window.__blWorkletStatus, 'no addModule', ctx.state);
+			return;
 		}
+		aw.__blHooked = true;
+		var orig = aw.addModule.bind(aw);
+		aw.addModule = function (moduleUrl, options) {
+			console.log('worklet addModule', moduleUrl, 'state', ctx.state);
+			function attempt() {
+				return orig(moduleUrl, options).then(function (result) {
+					window.__blWorkletStatus = 'loaded';
+					console.log('worklet loaded', moduleUrl, 'state', ctx.state);
+					return result;
+				});
+			}
+			return attempt().catch(function (err) {
+				window.__blWorkletStatus = 'rejected';
+				console.error('worklet addModule rejected', moduleUrl, 'state', ctx.state, err);
+				return new Promise(function (resolve, reject) {
+					var ran = false;
+					function retry() {
+						if (ran) {
+							return;
+						}
+						ran = true;
+						console.log('worklet retry', moduleUrl, 'state', ctx.state);
+						attempt().then(function (result) {
+							window.__blWorkletStatus = 'loaded-retry';
+							console.log('worklet retry ok', ctx.state);
+							resolve(result);
+						}, function (err2) {
+							window.__blWorkletStatus = 'rejected-retry';
+							console.error('worklet retry failed', err2);
+							reject(err2);
+						});
+					}
+					if (ctx.state === 'running') {
+						retry();
+						return;
+					}
+					retries.push(retry);
+					ctx.addEventListener('statechange', function onState() {
+						if (ctx.state === 'running') {
+							ctx.removeEventListener('statechange', onState);
+							retry();
+						}
+					});
+				});
+			});
+		};
+	}
+	function Patched(opts) {
 		var ctx;
 		try {
-			ctx = new Native();
-		} catch (err) {
 			ctx = opts ? new Native(opts) : new Native();
+		} catch (err) {
+			console.error('AudioContext constructor failed, retrying without options', err);
+			ctx = new Native();
 		}
-		shared = ctx;
-		return remember(ctx);
+		remember(ctx);
+		hookWorklet(ctx);
+		console.log('AudioContext created', ctx.state, 'sampleRate', ctx.sampleRate, 'worklet', window.__blWorkletStatus);
+		if (window.__blAudioUnlocked && ctx.state !== 'running') {
+			ctx.resume();
+		}
+		return ctx;
 	}
 	Patched.prototype = Native.prototype;
 	Patched.__blackline = true;
@@ -185,37 +215,71 @@ html, body {
 	if (window.webkitAudioContext) {
 		window.webkitAudioContext = Patched;
 	}
-	function prime(ctx) {
-		if (!ctx) {
+	function logContexts(label) {
+		if (!contexts.length) {
+			console.log(label, 'missing', 'worklet', window.__blWorkletStatus);
 			return;
 		}
-		try {
-			var buf = ctx.createBuffer(1, 1, ctx.sampleRate || 48000);
-			var src = ctx.createBufferSource();
-			src.buffer = buf;
-			src.connect(ctx.destination);
-			src.start(0);
-		} catch (err) {}
-	}
-	window.__blEnsureAudio = function () {
-		var Ctx = window.AudioContext || window.webkitAudioContext;
-		var ctx = shared;
-		if (!ctx || ctx.state === "closed") {
-			ctx = new Ctx();
-		}
-		prime(ctx);
-		return ctx;
-	};
-	window.__blResumeAudio = function () {
 		contexts.forEach(function (ctx) {
-			if (!ctx || ctx.state === "closed" || ctx.state === "running") {
+			console.log(label, ctx.state, 'worklet', window.__blWorkletStatus);
+		});
+	}
+	function flushRetries() {
+		var pending = retries.splice(0, retries.length);
+		pending.forEach(function (retry) {
+			retry();
+		});
+	}
+	window.__blResumeAudio = function () {
+		logContexts('AudioContext state');
+		contexts.forEach(function (ctx) {
+			if (!ctx || ctx.state === 'closed' || ctx.state === 'running') {
 				return;
 			}
-			ctx.resume();
-			prime(ctx);
+			ctx.resume().then(function () {
+				console.log('AudioContext state', ctx.state, 'worklet', window.__blWorkletStatus);
+				flushRetries();
+			}, function (err) {
+				console.error('AudioContext resume failed', err);
+			});
 		});
 	};
+	var unlocked = false;
+	function unlock() {
+		if (unlocked) {
+			return;
+		}
+		unlocked = true;
+		window.__blAudioUnlocked = true;
+		try {
+			if (navigator.audioSession) {
+				navigator.audioSession.type = 'playback';
+				console.log('audioSession', navigator.audioSession.type);
+			}
+		} catch (err) {
+			console.error('audioSession', err);
+		}
+		var el = document.getElementById('bl-silent');
+		if (el) {
+			var played = el.play();
+			if (played && played.catch) {
+				played.catch(function (err) {
+					console.error('silent audio', err);
+				});
+			}
+		}
+		logContexts('AudioContext state before resume');
+		window.__blResumeAudio();
+		flushRetries();
+	}
+	var listen = { capture: true, passive: true, once: true };
+	['touchstart', 'touchend', 'pointerdown', 'click'].forEach(function (type) {
+		window.addEventListener(type, unlock, listen);
+	});
 })();
+		</script>
+		<script src="index.js"></script>
+		<script>
 // iOS Safari will pan, double-tap zoom, and pinch the page unless the canvas
 // itself refuses the gesture. Godot's own listener is not always registered
 // with passive:false for the gesture events, which only exist on WebKit.
@@ -346,60 +410,20 @@ const engine = new Engine(GODOT_CONFIG);
 			displayFailureNotice(missingMsg + missing.join('\n'));
 		}
 	} else {
-		// Safari will not run the audio worklet unless the context is
-		// resumed inside a user gesture before Godot calls addModule.
-		var tap = document.getElementById('tap-to-start');
-		statusOverlay.style.visibility = 'visible';
-		if (tap) {
-			tap.style.display = 'block';
-		}
-		var started = false;
-		function startEngine() {
-			setStatusMode('progress');
-			engine.startGame({
-				'onProgress': function (current, total) {
-					if (current > 0 && total > 0) {
-						statusProgress.value = current;
-						statusProgress.max = total;
-					} else {
-						statusProgress.removeAttribute('value');
-						statusProgress.removeAttribute('max');
-					}
-				},
-			}).then(() => {
-				setStatusMode('hidden');
-			}, displayFailureNotice);
-		}
-		function begin(ev) {
-			if (started) {
-				return;
-			}
-			started = true;
-			if (ev && ev.preventDefault) {
-				ev.preventDefault();
-			}
-			if (tap) {
-				tap.style.display = 'none';
-			}
-			var ctx = window.__blEnsureAudio ? window.__blEnsureAudio() : null;
-			var go = function () {
-				console.log('AudioContext state before start', ctx ? ctx.state : 'missing');
-				startEngine();
-			};
-			if (ctx && ctx.state !== 'running' && ctx.resume) {
-				ctx.resume().then(function () {
-					console.log('AudioContext state before start', ctx.state);
-					startEngine();
-				}, go);
-				return;
-			}
-			go();
-		}
-		if (tap) {
-			tap.addEventListener('click', begin);
-		}
-		window.addEventListener('touchstart', begin, { passive: false });
-		window.addEventListener('pointerdown', begin);
+		setStatusMode('progress');
+		engine.startGame({
+			'onProgress': function (current, total) {
+				if (current > 0 && total > 0) {
+					statusProgress.value = current;
+					statusProgress.max = total;
+				} else {
+					statusProgress.removeAttribute('value');
+					statusProgress.removeAttribute('max');
+				}
+			},
+		}).then(() => {
+			setStatusMode('hidden');
+		}, displayFailureNotice);
 	}
 }());
 		</script>
