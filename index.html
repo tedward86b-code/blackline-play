@@ -97,6 +97,24 @@ html, body {
 	text-align: center;
 	z-index: 1;
 }
+
+#tap-to-start {
+	position: absolute;
+	left: 50%;
+	bottom: 16%;
+	transform: translateX(-50%);
+	z-index: 3;
+	display: none;
+	border: 0;
+	border-radius: 8px;
+	background: #38c6e6;
+	color: #071016;
+	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
+	font-size: 28px;
+	font-weight: 700;
+	padding: 16px 40px;
+	touch-action: manipulation;
+}
 		</style>
 		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
 <link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
@@ -118,6 +136,7 @@ html, body {
 		<div id="status">
 			<img id="status-splash" class="show-image--false fullsize--true use-filter--true" src="index.png" alt="">
 			<progress id="status-progress"></progress>
+			<button id="tap-to-start" type="button">Tap to start</button>
 			<div id="status-notice"></div>
 		</div>
 
@@ -133,16 +152,32 @@ html, body {
 		return;
 	}
 	var contexts = [];
+	var shared = null;
+	function remember(ctx) {
+		if (!ctx) {
+			return ctx;
+		}
+		if (contexts.indexOf(ctx) < 0) {
+			contexts.push(ctx);
+		}
+		window.__blAudioContexts = contexts;
+		return ctx;
+	}
 	function Patched(opts) {
+		// Godot constructs its context when the engine starts. Hand it the
+		// context this page already resumed inside the tap, so addModule
+		// runs on a running context instead of a suspended one.
+		if (shared && shared.state !== "closed") {
+			return remember(shared);
+		}
 		var ctx;
 		try {
 			ctx = new Native();
 		} catch (err) {
 			ctx = opts ? new Native(opts) : new Native();
 		}
-		contexts.push(ctx);
-		window.__blAudioContexts = contexts;
-		return ctx;
+		shared = ctx;
+		return remember(ctx);
 	}
 	Patched.prototype = Native.prototype;
 	Patched.__blackline = true;
@@ -150,26 +185,36 @@ html, body {
 	if (window.webkitAudioContext) {
 		window.webkitAudioContext = Patched;
 	}
-	function unlock() {
+	function prime(ctx) {
+		if (!ctx) {
+			return;
+		}
+		try {
+			var buf = ctx.createBuffer(1, 1, ctx.sampleRate || 48000);
+			var src = ctx.createBufferSource();
+			src.buffer = buf;
+			src.connect(ctx.destination);
+			src.start(0);
+		} catch (err) {}
+	}
+	window.__blEnsureAudio = function () {
+		var Ctx = window.AudioContext || window.webkitAudioContext;
+		var ctx = shared;
+		if (!ctx || ctx.state === "closed") {
+			ctx = new Ctx();
+		}
+		prime(ctx);
+		return ctx;
+	};
+	window.__blResumeAudio = function () {
 		contexts.forEach(function (ctx) {
-			if (!ctx) {
+			if (!ctx || ctx.state === "closed" || ctx.state === "running") {
 				return;
 			}
-			if (ctx.state !== "running") {
-				ctx.resume();
-			}
-			try {
-				var buf = ctx.createBuffer(1, 1, ctx.sampleRate || 48000);
-				var src = ctx.createBufferSource();
-				src.buffer = buf;
-				src.connect(ctx.destination);
-				src.start(0);
-			} catch (err) {}
+			ctx.resume();
+			prime(ctx);
 		});
-	}
-	window.addEventListener("touchstart", unlock, { passive: true });
-	window.addEventListener("pointerdown", unlock, { passive: true });
-	window.addEventListener("mousedown", unlock, true);
+	};
 })();
 // iOS Safari will pan, double-tap zoom, and pinch the page unless the canvas
 // itself refuses the gesture. Godot's own listener is not always registered
@@ -189,6 +234,13 @@ html, body {
 	document.addEventListener("visibilitychange", function () {
 		if (document.hidden) {
 			drop();
+		} else if (window.__blResumeAudio) {
+			window.__blResumeAudio();
+		}
+	});
+	window.addEventListener("focus", function () {
+		if (window.__blResumeAudio) {
+			window.__blResumeAudio();
 		}
 	});
 	window.addEventListener("pagehide", drop);
@@ -196,7 +248,7 @@ html, body {
 }());
 		</script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":22621348,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4,"serviceWorker":"index.service.worker.js"};
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":22622388,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4,"serviceWorker":"index.service.worker.js"};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
@@ -294,20 +346,60 @@ const engine = new Engine(GODOT_CONFIG);
 			displayFailureNotice(missingMsg + missing.join('\n'));
 		}
 	} else {
-		setStatusMode('progress');
-		engine.startGame({
-			'onProgress': function (current, total) {
-				if (current > 0 && total > 0) {
-					statusProgress.value = current;
-					statusProgress.max = total;
-				} else {
-					statusProgress.removeAttribute('value');
-					statusProgress.removeAttribute('max');
-				}
-			},
-		}).then(() => {
-			setStatusMode('hidden');
-		}, displayFailureNotice);
+		// Safari will not run the audio worklet unless the context is
+		// resumed inside a user gesture before Godot calls addModule.
+		var tap = document.getElementById('tap-to-start');
+		statusOverlay.style.visibility = 'visible';
+		if (tap) {
+			tap.style.display = 'block';
+		}
+		var started = false;
+		function startEngine() {
+			setStatusMode('progress');
+			engine.startGame({
+				'onProgress': function (current, total) {
+					if (current > 0 && total > 0) {
+						statusProgress.value = current;
+						statusProgress.max = total;
+					} else {
+						statusProgress.removeAttribute('value');
+						statusProgress.removeAttribute('max');
+					}
+				},
+			}).then(() => {
+				setStatusMode('hidden');
+			}, displayFailureNotice);
+		}
+		function begin(ev) {
+			if (started) {
+				return;
+			}
+			started = true;
+			if (ev && ev.preventDefault) {
+				ev.preventDefault();
+			}
+			if (tap) {
+				tap.style.display = 'none';
+			}
+			var ctx = window.__blEnsureAudio ? window.__blEnsureAudio() : null;
+			var go = function () {
+				console.log('AudioContext state before start', ctx ? ctx.state : 'missing');
+				startEngine();
+			};
+			if (ctx && ctx.state !== 'running' && ctx.resume) {
+				ctx.resume().then(function () {
+					console.log('AudioContext state before start', ctx.state);
+					startEngine();
+				}, go);
+				return;
+			}
+			go();
+		}
+		if (tap) {
+			tap.addEventListener('click', begin);
+		}
+		window.addEventListener('touchstart', begin, { passive: false });
+		window.addEventListener('pointerdown', begin);
 	}
 }());
 		</script>
